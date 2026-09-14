@@ -1,0 +1,74 @@
+# CODEOWNERS for rollroyces/utopia
+#
+# Each line is a path pattern followed by GitHub usernames that become
+# required reviewers on any PR touching that path. The last matching
+# pattern wins, so order matters: more specific patterns go below
+# general ones.
+#
+# GitHub treats this file as authoritative the moment it exists at
+# `.github/CODEOWNERS` (or `CODEOWNERS` at repo root, or `docs/CODEOWNERS`).
+# Required-reviewer enforcement must be turned on in branch protection:
+# `require_code_owner_reviews: true`. Without that flag, CODEOWNERS only
+# requests reviews; it does not block.
+#
+# Single-owner fork: only `@rollroyces` is listed. This makes the
+# ownership visible in PRs (UI shows "rollroyces requested review")
+# but does not actually block, since self-review is allowed.
+
+# Default: every file has @rollroyces as a fallback owner. Individual
+# lines below override for specific subsystems when other humans join.
+*                                   @rollroyces
+
+# --- Core data model --------------------------------------------------
+# Anything that defines a struct the rest of the workspace consumes.
+# Touching these ripples: be conservative, write a migration if the
+# shape changes.
+crates/utopia-core/src/models.rs     @rollroyces
+crates/utopia-core/src/text.rs       @rollroyces
+
+# --- Ingest: source-side connectors -----------------------------------
+# Per-source data acquisition. Each connector is one file; tests are
+# pure (no live cluster).
+crates/utopia-server/src/github_issues.rs  @rollroyces
+crates/utopia-server/src/jira_issues.rs    @rollroyces
+crates/utopia-server/src/notion.rs         @rollroyces
+crates/utopia-server/src/webdav.rs         @rollroyces
+crates/utopia-server/src/ingest_sources.rs @rollroyces
+
+# --- Query engines: read-side SQL dispatch ----------------------------
+# One engine per upstream. MySQL / Trino / Snowflake / Databricks
+# keys landed in #671/#678/#682; Postgres is the canonical example.
+crates/utopia-server/src/query_engine/  @rollroyces
+
+# --- Extract: text → facts ---------------------------------------------
+# The "what does the model see" pipeline. Bug here = model misreads.
+crates/utopia-extract/                 @rollroyces
+crates/utopia-server/src/extraction.rs  @rollroyces
+
+# --- Store: SQL schema + temporal queries ------------------------------
+# Schema migrations live here. Wrong migration = production downtime.
+crates/utopia-store/                   @rollroyces
+migrations/                           @rollroyces
+
+# --- Reason / Search / LLM: model-side helpers -------------------------
+crates/utopia-reason/                  @rollroyces
+crates/utopia-search/                  @rollroyces
+crates/utopia-llm/                     @rollroyces
+
+# --- API surface -------------------------------------------------------
+# Routes and middleware. Anything auth-related is sensitive.
+crates/utopia-server/src/api/          @rollroyces
+crates/utopia-server/src/auth.rs       @rollroyces
+
+# --- Frontend ---------------------------------------------------------
+web/                                   @rollroyces
+
+# --- Docs (decisions, design, proposals) -------------------------------
+docs/                                  @rollroyces
+.roadmap-proposals/                    @rollroyces
+
+# --- Build / CI / meta -------------------------------------------------
+# Workflow changes fire everyone's CI; require an explicit review.
+.github/workflows/                     @rollroyces
+.github/CODEOWNERS                     @rollroyces
+Cargo.toml                             @rollroyces
