@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 # **显式只读。** 没有这一块时它继承仓库级默认，而那个默认要为
