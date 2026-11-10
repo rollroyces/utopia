@@ -117,6 +117,10 @@ impl Fixture {
                 .find(|(name, _)| name == key)
                 .map(|(_, value)| value.parse::<usize>().unwrap()).unwrap_or(default);
             let path = request.url.path();
+            // Jira 的 JQL 日期字面量按账户时区解释，所以每一轮先读一次账户时区。
+            if path.ends_with("/myself") {
+                return ResponseTemplate::new(200).set_body_json(json!({"timeZone": "UTC"}));
+            }
             if path.ends_with("/comments") || path.ends_with("/events") {
                 if let Some((kind, count)) = feed.oversized_discussion {
                     if path.ends_with(kind) && path.contains("/issues/1/") {

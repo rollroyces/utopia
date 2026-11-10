@@ -31,6 +31,14 @@
 //! 时间格式必须是 Jira 认的那种（不是 RFC3339），且**要带引号**——
 //! 这两点写错的症状都是 400，而不是"查不到"。
 //!
+//! ## 下界写在账户时区里
+//!
+//! JQL 里没有时区的日期字面量，Jira 按**账户时区**解释（账户时区在
+//! `/rest/api/2/myself` 里）。所以下界必须写成那个时区的墙上时间：
+//! 写 UTC 的墙上时间等于把下界往后推了账户与 UTC 的时差，UTC-5 的账户
+//! 就往后推五小时，那五个小时里的更新被**静默漏掉**（#1484）。
+//! 读账户时区、换算、边界见 [`jql`] 与 [`jql_bound`]。
+//!
 //! ## Server/DC 与 Cloud 的差别
 //!
 //! 本模块按 **API v2**（Jira Server/DC）写。Cloud 的 v3 把 `description` 与
@@ -42,7 +50,8 @@
 //! 按 `nextPageToken` 翻页、`isLast` 收尾，没有 `startAt` 也没有 `total`。
 //! Server/DC 仍只有旧端点，所以只对 Cloud 站点换。
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Offset, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -261,16 +270,93 @@ pub fn render(issue: &Issue) -> String {
 
 /// 增量用的 JQL。**时间格式是 Jira 自己的**（`yyyy-MM-dd HH:mm`），不是 RFC3339，
 /// 而且要带引号——两点写错的症状都是 400，不是"查不到"。
-pub fn jql(project: &str, since: Option<DateTime<Utc>>) -> String {
+///
+/// `since` 是下界（上一轮的检查点），写成**账户时区**里的墙上时间：Jira 按
+/// 账户时区解释没有时区的字面量，写 UTC 的墙上时间等于把下界往后推了账户
+/// 与 UTC 的时差，那段里的更新被静默漏掉（#1484）。
+///
+/// `now` 是这一轮请求的时刻。它定夏令时切换附近往哪边偏（见 [`jql_bound`]），
+/// 也让测试能钉住一个时刻——不钉住的话，同一个检查点在不同的时刻会写出
+/// 不同的 JQL，测试就没法断言了。
+pub fn jql(project: &str, since: Option<DateTime<Utc>>, now: DateTime<Utc>, zone: &Tz) -> String {
     let mut q = format!("project = {project}");
     if let Some(t) = since {
-        q.push_str(&format!(
-            " AND updated >= \"{}\"",
-            t.format("%Y-%m-%d %H:%M")
-        ));
+        q.push_str(&format!(" AND updated >= \"{}\"", jql_bound(t, now, zone)));
     }
     q.push_str(" ORDER BY updated ASC, key ASC");
     q
+}
+
+/// 把检查点写成 Jira 会读成的那个时刻的墙上时间。
+///
+/// Jira 把没有时区的墙上时间按账户时区换回一个时刻，而它取的是**哪个时刻**
+/// 的偏移，Jira 没有写明：可能是墙上时间自己的，也可能是请求那一刻的。
+/// 两者只有在夏令时切换附近才不同，所以这里取**较早**的那个偏移——无论按
+/// 哪一种解释，下界都不会晚于检查点，最坏是多读一点，而多读的那些会被
+/// 检查点过滤掉（[`fetch_window_pass`] 里 `updated <= checkpoint` 那一条）。
+///
+/// 墙上时间自己还可能落在夏令时切换的另一侧：那样换算会把下界推后一小时，
+/// 那正是这次要修的漏读，所以遇到这种就让出一个小时。
+fn jql_bound(t: DateTime<Utc>, now: DateTime<Utc>, zone: &Tz) -> String {
+    let offset = earlier_offset(
+        offset_at(zone, t.naive_utc()),
+        offset_at(zone, now.naive_utc()),
+    );
+    let wall = t.naive_utc() + offset;
+    let bound = if offset_at(zone, wall) == offset {
+        wall
+    } else {
+        wall - chrono::Duration::hours(1)
+    };
+    bound.format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// 某个时刻的账户时区偏移（夏令时在算之内）。
+fn offset_at(zone: &Tz, at: NaiveDateTime) -> FixedOffset {
+    zone.offset_from_utc_datetime(&at).fix()
+}
+
+/// 两个偏移里较早的那个：UTC 偏移更小的那个，也就是更西、墙上时间更早的那个。
+fn earlier_offset(a: FixedOffset, b: FixedOffset) -> FixedOffset {
+    if a.local_minus_utc() <= b.local_minus_utc() {
+        a
+    } else {
+        b
+    }
+}
+
+/// `/rest/api/2/myself` 里的账户时区。
+#[derive(Debug, Deserialize)]
+struct CurrentUser {
+    #[serde(rename = "timeZone")]
+    time_zone: Option<String>,
+}
+
+/// 读账户时区。
+///
+/// 读不到就报错，不猜：时区猜错的后果是**静默漏读**一段更新——下界被推到
+/// 后面，那段时间里的工单再也读不到了。报错至少让这一轮失败并且看得见。
+pub async fn account_zone(
+    http: &reqwest::Client,
+    base_url: &str,
+    auth: Option<&str>,
+) -> anyhow::Result<Tz> {
+    let url = reqwest::Url::parse(&format!(
+        "{}/rest/api/2/myself",
+        base_url.trim_end_matches('/')
+    ))?;
+    let me: CurrentUser = fetch_page(http, url, auth).await?;
+    let id = me
+        .time_zone
+        .map(|zone| zone.trim().to_string())
+        .filter(|zone| !zone.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Jira did not report the account's time zone"))?;
+    id.parse::<Tz>().map_err(|_| {
+        anyhow::anyhow!(
+            "Jira account time zone {id:?} is not an IANA time zone; \
+             set the account's time zone to one, e.g. Europe/Berlin"
+        )
+    })
 }
 
 pub struct IssueWindow {
@@ -280,6 +366,8 @@ pub struct IssueWindow {
 
 /// 复读固定的已选前缀，检测更新导致的 offset 位移；变化时不确认本轮 checkpoint。
 /// `cloud` 由调用方按 [`is_jira_cloud`] 给出，测试的本地 mock 才能走 Cloud 的翻页。
+/// `zone` 是账户时区（[`account_zone`]）：下界按它写成墙上时间。
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_window(
     http: &reqwest::Client,
     base_url: &str,
@@ -288,8 +376,9 @@ pub async fn fetch_window(
     since: Option<DateTime<Utc>>,
     item_limit: usize,
     auth: Option<&str>,
+    zone: &Tz,
 ) -> anyhow::Result<IssueWindow> {
-    let query = jql(project, since);
+    let query = jql(project, since, Utc::now(), zone);
     let (window, positions) =
         fetch_window_pass(http, base_url, cloud, &query, since, item_limit, auth, None).await?;
     if let Some(checkpoint) = window
@@ -490,7 +579,10 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, Request, ResponseTemplate,
+    };
 
     fn listing_row(number: i64, updated: &str) -> Value {
         json!({"key": format!("X-{number}"), "fields": {"summary": "Issue", "updated": updated}})
@@ -590,6 +682,7 @@ mod tests {
             None,
             200,
             Some("Bearer fixture"),
+            &Tz::UTC,
         )
         .await
         .unwrap();
@@ -619,7 +712,7 @@ mod tests {
             .await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let since = Some("2026-01-02T00:00:00Z".parse().unwrap());
-        let window = fetch_window(&http, &server.uri(), false, "X", since, 200, None)
+        let window = fetch_window(&http, &server.uri(), false, "X", since, 200, None, &Tz::UTC)
             .await
             .unwrap();
         assert!(window.issues.is_empty());
@@ -649,7 +742,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let http = reqwest::Client::builder().no_proxy().build().unwrap();
-            let first = fetch_window(&http, &server.uri(), false, "X", None, 200, None)
+            let first = fetch_window(&http, &server.uri(), false, "X", None, 200, None, &Tz::UTC)
                 .await
                 .unwrap();
             assert_eq!(first.issues.len(), group_size as usize);
@@ -672,6 +765,7 @@ mod tests {
                 first.checkpoint,
                 200,
                 None,
+                &Tz::UTC,
             )
             .await
             .unwrap();
@@ -713,14 +807,15 @@ mod tests {
             .mount(&server)
             .await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let result = fetch_window(&http, &server.uri(), false, "X", None, 200, None).await;
+        let result =
+            fetch_window(&http, &server.uri(), false, "X", None, 200, None, &Tz::UTC).await;
         assert!(result
             .err()
             .unwrap()
             .to_string()
             .contains("changed during pagination"));
 
-        let recovered = fetch_window(&http, &server.uri(), false, "X", None, 200, None)
+        let recovered = fetch_window(&http, &server.uri(), false, "X", None, 200, None, &Tz::UTC)
             .await
             .unwrap();
         let mut keys: Vec<_> = recovered.issues.iter().map(|issue| &issue.key).collect();
@@ -741,6 +836,7 @@ mod tests {
             recovered.checkpoint,
             200,
             None,
+            &Tz::UTC,
         )
         .await
         .unwrap();
@@ -762,7 +858,8 @@ mod tests {
             .mount(&server)
             .await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let result = fetch_window(&http, &server.uri(), false, "X", None, 200, None).await;
+        let result =
+            fetch_window(&http, &server.uri(), false, "X", None, 200, None, &Tz::UTC).await;
         assert!(result
             .err()
             .unwrap()
@@ -787,7 +884,8 @@ mod tests {
             .mount(&server)
             .await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let result = fetch_window(&http, &server.uri(), false, "X", None, 200, None).await;
+        let result =
+            fetch_window(&http, &server.uri(), false, "X", None, 200, None, &Tz::UTC).await;
         assert!(result
             .err()
             .unwrap()
@@ -803,7 +901,8 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(response))
                 .mount(&server)
                 .await;
-            let result = fetch_window(&http, &server.uri(), false, "X", None, 200, None).await;
+            let result =
+                fetch_window(&http, &server.uri(), false, "X", None, 200, None, &Tz::UTC).await;
             assert!(result
                 .err()
                 .unwrap()
@@ -846,7 +945,7 @@ mod tests {
             .mount(&server)
             .await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let window = fetch_window(&http, &server.uri(), true, "X", None, 200, None)
+        let window = fetch_window(&http, &server.uri(), true, "X", None, 200, None, &Tz::UTC)
             .await
             .unwrap();
         let keys: Vec<_> = window
@@ -868,7 +967,7 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let result = fetch_window(&http, &server.uri(), true, "X", None, 200, None).await;
+        let result = fetch_window(&http, &server.uri(), true, "X", None, 200, None, &Tz::UTC).await;
         assert!(result
             .err()
             .unwrap()
@@ -893,14 +992,144 @@ mod tests {
         let t = DateTime::parse_from_rfc3339("2026-08-30T12:34:56Z")
             .unwrap()
             .with_timezone(&Utc);
+        let now = DateTime::parse_from_rfc3339("2026-08-30T13:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert_eq!(
-            jql("KAFKA", Some(t)),
+            jql("KAFKA", Some(t), now, &Tz::UTC),
             "project = KAFKA AND updated >= \"2026-08-30 12:34\" ORDER BY updated ASC, key ASC"
         );
         assert_eq!(
-            jql("KAFKA", None),
+            jql("KAFKA", None, now, &Tz::UTC),
             "project = KAFKA ORDER BY updated ASC, key ASC"
         );
+    }
+
+    /// **下界写在账户时区里**（#1484）。
+    ///
+    /// Jira 按账户时区解释 JQL 里没有时区的日期字面量。UTC-5 的账户读到
+    /// 12:34Z 时的本地墙上时间是 07:34，不是 12:34——写 12:34 等于把下界
+    /// 往后推了五小时，那五小时里的更新被**静默漏掉**。
+    #[test]
+    fn the_lower_bound_is_written_in_the_account_time_zone() {
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let t = DateTime::parse_from_rfc3339("2026-01-02T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let now = DateTime::parse_from_rfc3339("2026-01-02T13:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            jql("X", Some(t), now, &zone),
+            "project = X AND updated >= \"2026-01-02 07:34\" ORDER BY updated ASC, key ASC"
+        );
+    }
+
+    /// **下界永远不晚于检查点。**
+    ///
+    /// Jira 把墙上时间换回时刻时取的是哪个偏移，它没有写明：可能是墙上时间
+    /// 自己的，也可能是请求那一刻的。两种解释都得成立，所以无论时区、无论
+    /// 夏令时切换前后，下界只能在检查点之前或相等——晚一刻就是漏读。
+    #[test]
+    fn the_lower_bound_never_moves_later_than_the_checkpoint() {
+        for zone_id in [
+            "UTC",
+            "America/New_York",
+            "Europe/Berlin",
+            "Asia/Shanghai",
+            "Australia/Lord_Howe",
+        ] {
+            let zone: Tz = zone_id.parse().unwrap();
+            for instant in [
+                "2026-01-15T12:34:56Z",
+                "2026-03-08T06:59:59Z", // 美洲夏令时开始的前一秒
+                "2026-03-08T07:00:01Z", // 之后一秒
+                "2026-11-01T05:59:59Z", // 结束的前一秒
+                "2026-11-01T06:00:01Z", // 之后一秒
+            ] {
+                let t = DateTime::parse_from_rfc3339(instant)
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let now = t + chrono::Duration::hours(2);
+                let bound = jql_bound(t, now, &zone);
+                let wall = NaiveDateTime::parse_from_str(&bound, "%Y-%m-%d %H:%M").unwrap();
+                // Jira 的两种解释：按墙上时间自己的偏移，或按请求那一刻的偏移。
+                for offset in [offset_at(&zone, wall), offset_at(&zone, now.naive_utc())] {
+                    let read = DateTime::<Utc>::from_naive_utc_and_offset(wall, Utc) - offset;
+                    assert!(
+                        read <= t,
+                        "{zone_id} at {instant}: Jira reads {bound} as {read}, \
+                         which is later than the checkpoint {t}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 账户时区从 `/rest/api/2/myself` 读——Jira 唯一说账户时区的地方。
+    #[tokio::test]
+    async fn the_account_time_zone_is_read_from_the_current_user() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/2/myself"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"timeZone": "America/New_York"})),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let zone = account_zone(&http, &server.uri(), None).await.unwrap();
+        assert_eq!(zone, "America/New_York".parse::<Tz>().unwrap());
+    }
+
+    /// 读不到时区就报错，不猜。猜错的后果是静默漏读一段更新——
+    /// 那比这一轮失败更坏，失败至少看得见。
+    #[tokio::test]
+    async fn an_account_time_zone_we_cannot_resolve_fails_the_round() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/2/myself"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"timeZone": "Custom Time Zone"})),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = account_zone(&http, &server.uri(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not an IANA time zone"), "{error}");
+    }
+
+    /// #1484 的回归：真正发出去的 JQL 里，下界是账户时区的墙上时间。
+    #[tokio::test]
+    async fn the_requested_bound_is_the_account_time_zone_wall_clock() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(move |request: &Request| {
+                let query = request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "jql")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                assert!(
+                    query.contains("updated >= \"2026-01-02 07:34\""),
+                    "the bound was not written in the account's time zone: {query}"
+                );
+                ResponseTemplate::new(200).set_body_json(json!({"issues": [], "total": 0}))
+            })
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let zone: Tz = "America/New_York".parse().unwrap();
+        let since = Some("2026-01-02T12:34:56Z".parse::<DateTime<Utc>>().unwrap());
+        let window = fetch_window(&http, &server.uri(), false, "X", since, 200, None, &zone)
+            .await
+            .unwrap();
+        assert!(window.issues.is_empty());
     }
 
     /// **拿真实响应钉住字段形状。**

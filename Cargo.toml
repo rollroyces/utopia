@@ -39,6 +39,10 @@ thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+# IANA 时区库：Jira 把 JQL 里没有时区的日期字面量按**账户时区**解释，
+# 而账户时区只有名字（`/rest/api/2/myself` 的 `timeZone`），要换算成墙上
+# 时间就得查库。没有它就只能在 UTC 和猜之间选一个，后者会漏读。
+chrono-tz = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
 # 凭据静态加密（core::secrets）：AES-256-GCM，钥匙不进库
 aes-gcm = "0.10"

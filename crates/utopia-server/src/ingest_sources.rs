@@ -1248,6 +1248,9 @@ async fn sync_jira_issues(
     .await?;
 
     let cloud = crate::jira_issues::is_jira_cloud(base_url);
+    // 账户时区：Jira 按它解释 JQL 里没有时区的日期字面量，所以下界得写成
+    // 那个时区的墙上时间。读不到就报错，不猜——猜错就是静默漏读（#1484）。
+    let zone = crate::jira_issues::account_zone(&http, base_url, auth).await?;
     let window = crate::jira_issues::fetch_window(
         &http,
         base_url,
@@ -1256,6 +1259,7 @@ async fn sync_jira_issues(
         since,
         MAX_NEW_PER_SYNC,
         auth,
+        &zone,
     )
     .await?;
     let mut stats = SyncStats {

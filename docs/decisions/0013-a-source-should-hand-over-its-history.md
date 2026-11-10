@@ -41,6 +41,19 @@ Wikipedia; there revisions have to be sampled, an issue tracker hands the events
    omit `comment` and no comments come back; list nothing and one response runs to hundreds
    of KB. `expand=changelog` returns the field-level history in one call.
 
+   *Added 2026-11-10 (#1484):* the date literal in that JQL carries no time zone, and Jira
+   reads it in the **account's** zone — the one `/rest/api/2/myself` reports, not UTC and not
+   the server's. Writing the checkpoint as a UTC wall clock therefore pushed the lower bound
+   *forward* by the account's offset: a UTC-5 account skipped the five hours between its
+   checkpoint and the bound, and the round reported itself complete. The bound is now written
+   in the account's own zone, read per round from `/rest/api/2/myself`. A zone we cannot
+   resolve fails the round instead of guessing, because a guessed zone is a silent gap in the
+   ledger. Which instant Jira takes the offset from is not written down — the literal's own,
+   or the request's — so the bound is written as early as either reading allows: the earlier
+   of the two offsets, and an hour given up when the literal would land on the other side of
+   a daylight-saving change. Both readings then agree that the bound is not later than the
+   checkpoint, and the test says so for every zone and every switch-over hour.
+
 4. **Fixtures come from real responses.** Hand-written JSON only proves that the shape I
    imagined parses. Both fixtures come from publicly readable instances (`deeplethe/utopia`,
    `issues.apache.org`), trimmed to the declared fields — the trimming itself shows that
